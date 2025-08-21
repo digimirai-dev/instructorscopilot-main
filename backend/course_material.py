@@ -1,0 +1,807 @@
+import pathlib
+import os
+import re
+import json
+from docx import Document
+from docx.shared import Inches
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.shared import RGBColor
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import inch
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak
+from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_JUSTIFY
+
+# Import LLM helpers
+try:
+    from llm import get_gemini_client, get_google_search_tool, generate_course_content, system_prompt
+except Exception:
+    # Allow running without LLM for fallback
+    get_gemini_client = None
+    get_google_search_tool = None
+    generate_course_content = None
+    system_prompt = None
+
+def read_all_text_files():
+    """Read all text files from the Inputs and Outputs directory"""
+    text_files_content = {}
+    
+    # Read from home directory "Inputs and Outputs"
+    home_dir_path = pathlib.Path("Inputs and Outputs")
+    
+    if not home_dir_path.exists():
+        return text_files_content
+    
+    # Find all .txt files in the directory
+    for txt_file in home_dir_path.glob("*.txt"):
+        try:
+            with open(txt_file, 'r', encoding='utf-8') as f:
+                content = f.read()
+                text_files_content[txt_file.name] = content
+        except Exception as e:
+            pass
+    
+    # Also check copilot subdirectory
+    copilot_dir_path = pathlib.Path("copilot/Inputs and Outputs")
+    if copilot_dir_path.exists():
+        for txt_file in copilot_dir_path.glob("*.txt"):
+            try:
+                with open(txt_file, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                    # Use relative path as key to avoid conflicts
+                    key = f"copilot/{txt_file.name}"
+                    text_files_content[key] = content
+            except Exception as e:
+                pass
+    
+    return text_files_content
+
+def extract_course_name_from_content(content):
+    """Extract course name from the content and format as subject_course"""
+    patterns = [
+        r'# Course Name:\s*([^\n]+)',  # # Course Name: Course Title
+        r'# ([^:\n]+):\s*([^:\n]+)',  # # Main Title: Subtitle  
+        r'# ([^:\n]+)',  # # Main Title
+        r'## Course Outline:\s*([^\n]+)',  # ## Course Outline: Name
+        r'Course Title:\s*([^\n]+)',  # Course Title: Name
+        r'Course:\s*([^\n]+)',  # Course: Name
+        r'Title:\s*([^\n]+)',  # Title: Name
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, content, re.IGNORECASE | re.MULTILINE)
+        if match:
+            if len(match.groups()) == 2:  # Title: Subtitle pattern
+                course_name = f"{match.group(1).strip()} {match.group(2).strip()}"
+            else:
+                course_name = match.group(1).strip()
+            
+            # Extract the main subject and format as subject_course
+            course_name = re.sub(r'\s+', ' ', course_name)
+            course_name = re.sub(r'[^\w\s-]', '', course_name)
+            course_name = course_name.strip()
+            
+            # Extract key subject words and format
+            words = course_name.lower().split()
+            key_words = []
+            for word in words:
+                if word not in ['advanced', 'introduction', 'to', 'and', 'the', 'of', 'in', 'course', 'fundamentals', 'basics']:
+                    key_words.append(word)
+            
+            if key_words:
+                subject_name = '_'.join(key_words[:3])  # Take first 3 key words
+                return f"{subject_name}_course"
+    
+    return "course_material"
+
+def parse_weeks_from_content(content):
+    """Parse the content to extract individual weeks"""
+    weeks = []
+    
+    # Look for week headers and find content between them
+    week_headers = list(re.finditer(r'# Week (\d+):', content, re.IGNORECASE))
+    
+    if week_headers:
+        for i, match in enumerate(week_headers):
+            week_num = int(match.group(1))
+            start_pos = match.start()
+            
+            # Find content until next week or end
+            if i + 1 < len(week_headers):
+                end_pos = week_headers[i + 1].start()
+                week_content = content[start_pos:end_pos]
+            else:
+                week_content = content[start_pos:]
+            
+            weeks.append({
+                'number': week_num,
+                'type': 'Week',
+                'content': week_content.strip(),
+                'title': f"Week {week_num}"
+            })
+    else:
+        # Fallback: treat entire content as one section
+        weeks.append({
+            'number': 1,
+            'type': 'Course',
+            'content': content.strip(),
+            'title': "Complete Course Content"
+        })
+    
+    weeks.sort(key=lambda x: x['number'])
+    return weeks
+
+def _extract_section(content: str, header_regex: str) -> str | None:
+    """Extract section text by header regex until next top-level header or end."""
+    match = re.search(header_regex, content, re.IGNORECASE)
+    if not match:
+        return None
+    start = match.end()
+    next_match = re.search(r"\n##?\s+|\n#\s+Week\s+\d+", content[start:], re.IGNORECASE)
+    if next_match:
+        end = start + next_match.start()
+    else:
+        end = len(content)
+    return content[start:end].strip()
+
+
+def _parse_weeks_simple(content: str):
+    """Parse '# Week N:' blocks with their content."""
+    weeks = []
+    for m in re.finditer(r"^#\s*Week\s*(\d+)\s*:(.*)$", content, re.MULTILINE | re.IGNORECASE):
+        num = int(m.group(1))
+        title_line = m.group(0)
+        start = m.end()
+        next_m = re.search(r"^#\s*Week\s*\d+\s*:.*$", content[start:], re.MULTILINE | re.IGNORECASE)
+        end = start + next_m.start() if next_m else len(content)
+        block = content[start:end].strip()
+        weeks.append({
+            'number': num,
+            'title': re.sub(r'^#\s*', '', title_line).strip(),
+            'content': block,
+        })
+    weeks.sort(key=lambda x: x['number'])
+    return weeks
+
+
+def sanitize_filename(name: str) -> str:
+    name = name.strip().replace('\n', ' ')
+    name = re.sub(r"[\\/:*?\"<>|]", "_", name)
+    name = re.sub(r"\s+", " ", name)
+    return name or "course_material"
+
+
+def create_combined_docx(content, course_title, output_dir):
+    """Create DOCX with layout: Title, Course Overview, Weekly Summary, Week sections (each new page)."""
+    doc = Document()
+    
+    # Set margins
+    sections = doc.sections
+    for section in sections:
+        section.top_margin = Inches(1)
+        section.bottom_margin = Inches(1)
+        section.left_margin = Inches(1)
+        section.right_margin = Inches(1)
+    
+    # Add title
+    title = doc.add_heading(f'{course_title}', 0)
+    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    
+    # Process the content line by line to maintain order and avoid duplication
+    lines = content.split('\n')
+    current_paragraph = ""
+    in_code_block = False
+    week_started = False
+    
+    for line in lines:
+        original_line = line
+        line = line.strip()
+        
+        # Skip the main title if it appears in content (already added above)
+        if line.startswith('# Course Name:') or (line.startswith('#') and course_title.lower() in line.lower() and not line.startswith('# Week')):
+            continue
+        
+        if not line:
+            if current_paragraph:
+                if '**' in current_paragraph:
+                    p = doc.add_paragraph()
+                    parts = current_paragraph.split('**')
+                    for i, part in enumerate(parts):
+                        run = p.add_run(part)
+                        if i % 2 == 1:
+                            run.bold = True
+                else:
+                    doc.add_paragraph(current_paragraph)
+                current_paragraph = ""
+            doc.add_paragraph()
+            continue
+            
+        if line.startswith('```'):
+            if current_paragraph:
+                doc.add_paragraph(current_paragraph)
+                current_paragraph = ""
+            in_code_block = not in_code_block
+            continue
+            
+        if in_code_block:
+            p = doc.add_paragraph(original_line)
+            for run in p.runs:
+                run.font.name = 'Courier New'
+                run.font.size = Inches(0.1)
+            continue
+        
+        # Handle Week headers - add page break before each week (except first)
+        if line.startswith('# Week '):
+            if current_paragraph:
+                doc.add_paragraph(current_paragraph)
+                current_paragraph = ""
+            if week_started:  # Add page break before subsequent weeks
+                doc.add_page_break()
+            week_started = True
+            doc.add_heading(line.replace('# ', ''), 1)
+            doc.add_paragraph('─' * 60)
+        elif line.startswith('#### '):
+            if current_paragraph:
+                doc.add_paragraph(current_paragraph)
+                current_paragraph = ""
+            doc.add_heading(line.replace('#### ', ''), 4)
+        elif line.startswith('### '):
+            if current_paragraph:
+                doc.add_paragraph(current_paragraph)
+                current_paragraph = ""
+            doc.add_heading(line.replace('### ', ''), 3)
+        elif line.startswith('## '):
+            if current_paragraph:
+                doc.add_paragraph(current_paragraph)
+                current_paragraph = ""
+            doc.add_heading(line.replace('## ', ''), 2)
+            doc.add_paragraph('─' * 60)
+        elif line.startswith('- ') or line.startswith('* '):
+            if current_paragraph:
+                doc.add_paragraph(current_paragraph)
+                current_paragraph = ""
+            bullet_text = line.replace('- ', '').replace('* ', '')
+            if '**' in bullet_text:
+                p = doc.add_paragraph(style='List Bullet')
+                parts = bullet_text.split('**')
+                for i, part in enumerate(parts):
+                    run = p.add_run(part)
+                    if i % 2 == 1:
+                        run.bold = True
+            else:
+                doc.add_paragraph(bullet_text, style='List Bullet')
+        elif re.match(r'^\d+\. ', line):
+            if current_paragraph:
+                doc.add_paragraph(current_paragraph)
+                current_paragraph = ""
+            list_text = re.sub(r'^\d+\. ', '', line)
+            if '**' in list_text:
+                p = doc.add_paragraph(style='List Number')
+                parts = list_text.split('**')
+                for i, part in enumerate(parts):
+                    run = p.add_run(part)
+                    if i % 2 == 1:
+                        run.bold = True
+            else:
+                doc.add_paragraph(list_text, style='List Number')
+        elif line.startswith('---') or line == '=' * len(line):
+            if current_paragraph:
+                doc.add_paragraph(current_paragraph)
+                current_paragraph = ""
+            doc.add_paragraph('─' * 60)
+        else:
+            if current_paragraph:
+                current_paragraph += " " + line
+            else:
+                current_paragraph = line
+    
+    # Add any remaining paragraph
+    if current_paragraph:
+        if '**' in current_paragraph:
+            p = doc.add_paragraph()
+            parts = current_paragraph.split('**')
+            for i, part in enumerate(parts):
+                run = p.add_run(part)
+                if i % 2 == 1:
+                    run.bold = True
+        else:
+            doc.add_paragraph(current_paragraph)
+        
+    # Save document
+    filename = f"{sanitize_filename(course_title)}.docx"
+    filepath = os.path.join(output_dir, filename)
+    
+    try:
+        doc.save(filepath)
+        return filepath
+    except Exception as e:
+        return None
+
+def create_combined_pdf(content, course_title, output_dir):
+    """Create PDF with layout: Title, then all content in order as generated by LLM."""
+    filename = f"{sanitize_filename(course_title)}.pdf"
+    filepath = os.path.join(output_dir, filename)
+    
+    try:
+        doc = SimpleDocTemplate(
+            filepath,
+            pagesize=A4,
+            rightMargin=1*inch,
+            leftMargin=1*inch,
+            topMargin=1*inch,
+            bottomMargin=1*inch
+        )
+        
+        styles = getSampleStyleSheet()
+        
+        # Custom styles
+        title_style = ParagraphStyle(
+            'CustomTitle',
+            parent=styles['Heading1'],
+            fontSize=24,
+            spaceAfter=30,
+            alignment=TA_CENTER,
+            textColor='darkblue'
+        )
+        
+        week_heading_style = ParagraphStyle(
+            'WeekHeading',
+            parent=styles['Heading1'],
+            fontSize=16,
+            spaceAfter=15,
+            spaceBefore=20,
+            textColor='darkblue'
+        )
+        
+        section_heading_style = ParagraphStyle(
+            'SectionHeading',
+            parent=styles['Heading2'],
+            fontSize=14,
+            spaceAfter=10,
+            spaceBefore=15,
+            textColor='darkblue'
+        )
+        
+        normal_style = ParagraphStyle(
+            'CustomNormal',
+            parent=styles['Normal'],
+            fontSize=11,
+            spaceAfter=8,
+            alignment=TA_JUSTIFY,
+            leftIndent=0,
+            rightIndent=0
+        )
+        
+        bullet_style = ParagraphStyle(
+            'CustomBullet',
+            parent=styles['Normal'],
+            fontSize=11,
+            spaceAfter=4,
+            leftIndent=20,
+            bulletIndent=10
+        )
+        
+        elements = []
+        
+        # Add title
+        elements.append(Paragraph(course_title, title_style))
+        elements.append(Spacer(1, 30))
+        
+        # Process content line by line to maintain order
+        lines = content.split('\n')
+        current_paragraph = ""
+        week_started = False
+        
+        for line in lines:
+            line = line.strip()
+            
+            # Skip the main title if it appears in content (already added above)
+            if line.startswith('# Course Name:') or (line.startswith('#') and course_title.lower() in line.lower() and not line.startswith('# Week')):
+                continue
+            
+            if not line:
+                if current_paragraph:
+                    clean_para = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', current_paragraph)
+                    clean_para = re.sub(r'\*(.*?)\*', r'<i>\1</i>', clean_para)
+                    try:
+                        elements.append(Paragraph(clean_para, normal_style))
+                    except:
+                        clean_para = re.sub(r'<[^>]+>', '', clean_para)
+                        elements.append(Paragraph(clean_para, normal_style))
+                    current_paragraph = ""
+                elements.append(Spacer(1, 6))
+                continue
+            
+            # Handle Week headers - add page break before each week (except first)
+            if line.startswith('# Week '):
+                if current_paragraph:
+                    clean_para = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', current_paragraph)
+                    try:
+                        elements.append(Paragraph(clean_para, normal_style))
+                    except:
+                        clean_para = re.sub(r'<[^>]+>', '', clean_para)
+                        elements.append(Paragraph(clean_para, normal_style))
+                    current_paragraph = ""
+                
+                if week_started:  # Add page break before subsequent weeks
+                    elements.append(PageBreak())
+                week_started = True
+                
+                week_title = line.replace('# ', '')
+                elements.append(Paragraph(week_title, week_heading_style))
+                elements.append(Spacer(1, 10))
+            
+            # Handle other headings
+            elif line.startswith('### ') or line.startswith('## '):
+                if current_paragraph:
+                    clean_para = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', current_paragraph)
+                    try:
+                        elements.append(Paragraph(clean_para, normal_style))
+                    except:
+                        clean_para = re.sub(r'<[^>]+>', '', clean_para)
+                        elements.append(Paragraph(clean_para, normal_style))
+                    current_paragraph = ""
+                
+                heading_text = line.replace('### ', '').replace('## ', '')
+                elements.append(Paragraph(heading_text, section_heading_style))
+                elements.append(Spacer(1, 5))
+            
+            # Handle bullet points
+            elif line.startswith('- ') or line.startswith('* '):
+                if current_paragraph:
+                    clean_para = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', current_paragraph)
+                    try:
+                        elements.append(Paragraph(clean_para, normal_style))
+                    except:
+                        clean_para = re.sub(r'<[^>]+>', '', clean_para)
+                        elements.append(Paragraph(clean_para, normal_style))
+                    current_paragraph = ""
+                
+                bullet_text = line.replace('- ', '').replace('* ', '')
+                bullet_text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', bullet_text)
+                try:
+                    elements.append(Paragraph(f"• {bullet_text}", bullet_style))
+                except:
+                    clean_bullet = re.sub(r'<[^>]+>', '', bullet_text)
+                    elements.append(Paragraph(f"• {clean_bullet}", bullet_style))
+            
+            # Handle separator lines
+            elif line.startswith('---') or line == '=' * len(line):
+                if current_paragraph:
+                    clean_para = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', current_paragraph)
+                    try:
+                        elements.append(Paragraph(clean_para, normal_style))
+                    except:
+                        clean_para = re.sub(r'<[^>]+>', '', clean_para)
+                        elements.append(Paragraph(clean_para, normal_style))
+                    current_paragraph = ""
+                elements.append(Spacer(1, 10))
+            
+            # Regular content
+            else:
+                if current_paragraph:
+                    current_paragraph += " " + line
+                else:
+                    current_paragraph = line
+        
+        # Add any remaining paragraph
+        if current_paragraph:
+            clean_para = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', current_paragraph)
+            try:
+                elements.append(Paragraph(clean_para, normal_style))
+            except:
+                clean_para = re.sub(r'<[^>]+>', '', clean_para)
+                elements.append(Paragraph(clean_para, normal_style))
+        
+        # Build PDF
+        doc.build(elements)
+        return filepath
+        
+    except Exception as e:
+        return None
+
+# Update the LLM prompt to ensure proper structure ordering
+def build_structured_text_llm(raw_corpus: str, planner_text: str, title_hint: str | None) -> str | None:
+    """Use LLM to produce strict structured text with required layout."""
+    if not (get_gemini_client and get_google_search_tool and generate_course_content and system_prompt):
+        return None
+    client = get_gemini_client()
+    tool = get_google_search_tool()
+    task = (
+        "ROLE & GOAL\n"
+        "You are an expert instructional designer and content developer with 20+ years of experience creating comprehensive, teachable course materials. "
+        "Your task is to analyze the provided course content deeply and transform it into a detailed, structured syllabus that instructors can immediately use to teach. "
+        "Each week must contain substantial, in-depth content that fills 8+ pages when formatted for PDF/DOCX. "
+        "Prioritize the user's planner input and ensure every concept is thoroughly explained with practical applications.\n\n"
+        
+        "CONTENT ANALYSIS REQUIREMENTS\n"
+        "- Deeply analyze ALL provided text files to extract key concepts, learning objectives, practical examples, and case studies\n"
+        "- Identify the teaching methodology, difficulty level, and target audience from the planner content\n"
+        "- Extract specific algorithms, frameworks, methodologies, and implementation details mentioned\n"
+        "- Note any real-world applications, industry examples, or practical scenarios discussed\n"
+        "- Synthesize information from multiple sources to create coherent, comprehensive weekly modules\n"
+        "- Ensure content builds progressively from week to week with clear connections\n\n"
+        
+        "STRICT TOP-LEVEL STRUCTURE (must follow exactly)\n"
+        "1) DO NOT include a title line - the title will be handled separately\n"
+        "2) Start directly with '## Course Overview' – 2-3 comprehensive paragraphs covering scope, objectives, and learning outcomes\n"
+        "3) '## Prerequisites' – detailed list of required knowledge, skills, and background\n"
+        "4) '## Weekly Summary' – detailed bullet points (3-4 lines each) summarizing each week's focus and deliverables\n"
+        "5) Individual week sections starting with '# Week N: <descriptive title>' in ascending order\n"
+        "   After the last week, STOP. No additional sections.\n\n"
+        
+        "COMPREHENSIVE WEEK SECTION REQUIREMENTS (8+ pages per week)\n"
+        "Target length per week: 2,500-3,500 words minimum to ensure 8+ formatted pages\n"
+        "Each week MUST include the following detailed subsections:\n\n"
+        
+        "**Learning Objectives & Outcomes** (200-300 words)\n"
+        "- 5-7 specific, measurable learning objectives using Bloom's taxonomy\n"
+        "- Clear statements of what students will be able to do after completing the week\n"
+        "- Connection to overall course goals and previous weeks\n\n"
+        
+        "**Theoretical Foundation** (600-800 words)\n"
+        "- Comprehensive explanation of core concepts and principles\n"
+        "- Historical context and evolution of ideas where relevant\n"
+        "- Mathematical foundations, algorithms, or frameworks with step-by-step breakdowns\n"
+        "- Comparison with alternative approaches and their trade-offs\n"
+        "- Current research trends and future directions\n\n"
+        
+        "**Practical Applications & Industry Context** (400-500 words)\n"
+        "- 3-4 real-world examples showing how concepts apply in different industries\n"
+        "- Detailed case studies with specific companies, projects, or implementations\n"
+        "- Discussion of current market trends and business implications\n"
+        "- Analysis of success stories and lessons learned from failures\n\n"
+        
+        "**Hands-On Learning Activities** (500-600 words)\n"
+        "- Step-by-step guided exercises with clear instructions\n"
+        "- Programming assignments or practical projects with detailed specifications\n"
+        "- Problem-solving scenarios that require critical thinking\n"
+        "- Group activities and collaborative learning opportunities\n"
+        "- Assessment rubrics and success criteria\n\n"
+        
+        "**Technical Deep Dive** (400-500 words)\n"
+        "- Detailed implementation examples with code snippets or pseudocode\n"
+        "- Architecture diagrams and system design considerations\n"
+        "- Performance analysis and optimization strategies\n"
+        "- Common pitfalls and debugging techniques\n"
+        "- Integration with other systems and technologies\n\n"
+        
+        "**Critical Analysis & Evaluation** (300-400 words)\n"
+        "- Comparative analysis of different approaches or methodologies\n"
+        "- Evaluation criteria and metrics for success\n"
+        "- Ethical considerations and societal impact\n"
+        "- Limitations and constraints of current approaches\n"
+        "- Questions for further research and exploration\n\n"
+        
+        "**Assessment & Practice** (200-300 words)\n"
+        "- Self-assessment questions and knowledge checks\n"
+        "- Practice problems with varying difficulty levels\n"
+        "- Portfolio assignments and project milestones\n"
+        "- Peer review and feedback opportunities\n"
+        "- Preparation for upcoming weeks\n\n"
+        
+        "**Resources & Extended Learning** (200-300 words)\n"
+        "- Curated list of essential readings and references\n"
+        "- Recommended online courses, tutorials, and documentation\n"
+        "- Professional development opportunities and certifications\n"
+        "- Community resources and expert networks\n"
+        "- Tools and software recommendations\n\n"
+        
+        "FORMATTING & STRUCTURE REQUIREMENTS\n"
+        "- Use clear, descriptive subheadings for each section\n"
+        "- Include bullet points, numbered lists, and structured paragraphs for readability\n"
+        "- Provide concrete examples and scenarios throughout\n"
+        "- Use short paragraphs (3-4 sentences) interspersed with lists and examples\n"
+        "- Include visual descriptions where diagrams or charts would be helpful\n"
+        "- Ensure smooth transitions between sections and concepts\n\n"
+        
+        "CONTENT DEPTH & QUALITY STANDARDS\n"
+        "- Every concept must be explained thoroughly with multiple examples\n"
+        "- Include both theoretical understanding and practical application\n"
+        "- Provide context for why each topic is important and how it fits the bigger picture\n"
+        "- Address different learning styles through varied presentation methods\n"
+        "- Include challenging questions that promote critical thinking\n"
+        "- Ensure content is current, accurate, and industry-relevant\n\n"
+        
+        "CONSTRAINTS & GUARDRAILS\n"
+        "- Do NOT include any meta-references to prompts, agents, or AI tools\n"
+        "- Keep examples generic but realistic - avoid specific institutional references\n"
+        "- Maintain consistent numbering and formatting throughout\n"
+        "- Use only plain text and Markdown formatting (no tables or images)\n"
+        "- Ensure all technical information is accurate and up-to-date\n"
+        "- Build clear progression from basic to advanced concepts within each week\n\n"
+        
+        "FINAL QUALITY CHECKLIST\n"
+        "Before finalizing, ensure:\n"
+        "- Each week contains 2,500+ words of substantial, teachable content\n"
+        "- All required subsections are present and fully developed\n"
+        "- Content demonstrates deep understanding of the source materials\n"
+        "- Practical examples and applications are specific and detailed\n"
+        "- Learning objectives are clearly measurable and achievable\n"
+        "- Content flows logically and builds upon previous weeks\n"
+        "- Language is appropriate for the specified difficulty level and teaching style\n"
+        "- All concepts are thoroughly explained with sufficient detail for instruction\n"
+    )
+    
+    # Build course_content payload combining planner and corpus
+    course_content = (
+        (f"PLANNER INPUT:\n{planner_text}\n\n" if planner_text else "") +
+        (f"COMPREHENSIVE SOURCE MATERIALS:\n{raw_corpus}" if raw_corpus else "")
+    )
+    
+    try:
+        response = generate_course_content(
+            client=client,
+            teaching_style="",
+            duration="",
+            difficulty_level="",
+            google_search_tool=tool,
+            system_prompt=system_prompt,
+            filepath=pathlib.Path("Inputs and Outputs/curriculum.pdf"),
+            course_content=course_content,
+            task=task,
+        )
+        return response.text
+    except Exception:
+        return None
+
+
+def extract_title_from_planner(text: str) -> str | None:
+    # Try explicit course name patterns first
+    m = re.search(r"^#\s*Course Name:\s*(.+)$", text, re.MULTILINE)
+    if m:
+        return m.group(1).strip()
+    # Fall back to first H1 header
+    m = re.search(r"^#\s+(.+)$", text, re.MULTILINE)
+    if m:
+        return m.group(1).strip()
+    # Or bolded course name mention
+    m = re.search(r"\*\*Course Name\*\*\s*[:\-]?\s*(.+)$", text, re.IGNORECASE | re.MULTILINE)
+    if m:
+        return m.group(1).strip()
+    return None
+
+def write_structured_txt(structured_text: str, course_name: str, output_dir: str) -> str | None:
+    """Write the structured TXT to disk and return its path."""
+    try:
+        txt_path = os.path.join(output_dir, f"{sanitize_filename(course_name)}.txt")
+        with open(txt_path, 'w', encoding='utf-8') as f:
+            f.write(structured_text)
+        return txt_path
+    except Exception:
+        return None
+
+def get_duration_weeks():
+    """Read `user_config.json` and return the number of weeks as int if available."""
+    try:
+        with open('user_config.json', 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        duration = data.get('duration', '')
+        match = re.search(r'(\d+)\s*week', duration, re.IGNORECASE)
+        if match:
+            return int(match.group(1))
+    except Exception:
+        pass
+    return None
+
+def should_only_list_weeks(content: str) -> bool:
+    """Return True if there are no explicit week sections in content and we have a duration."""
+    has_week_sections = re.search(r'#\s*Week\s*\d+\s*[:\-]?', content or '', re.IGNORECASE) is not None
+    duration_weeks = get_duration_weeks()
+    return (not has_week_sections) and bool(duration_weeks and duration_weeks > 0)
+
+def get_subject_from_config() -> str | None:
+    """Return a sanitized subject string from user_config.json if available."""
+    try:
+        with open('user_config.json', 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        # Possible keys to look for
+        raw = data.get('subject') or data.get('course_subject') or data.get('course_name')
+        if raw and isinstance(raw, str):
+            # Sanitize to snake_case words
+            cleaned = re.sub(r'[^\w\s-]', '', raw).strip().lower()
+            cleaned = re.sub(r'\s+', ' ', cleaned)
+            parts = [p for p in cleaned.split(' ') if p]
+            if parts:
+                return '_'.join(parts)
+    except Exception:
+        pass
+    return None
+
+def main():
+    """Main function to generate combined course materials"""
+    # Read all text files
+    text_files = read_all_text_files()
+    
+    # Combine all content
+    combined_content = ""
+    
+    # Prioritize enhanced content if available
+    if 'enhanced_course_content.txt' in text_files:
+        combined_content = text_files['enhanced_course_content.txt']
+    else:
+        # Combine all available content
+        for filename, content in text_files.items():
+            combined_content += f"\n\n=== CONTENT FROM {filename.upper()} ===\n"
+            combined_content += content
+            combined_content += f"\n=== END OF {filename.upper()} ===\n"
+    
+    # Clean content - remove teaching agent prompts and system messages
+    lines = combined_content.split('\n')
+    cleaned_lines = []
+    skip_section = False
+    
+    for line in lines:
+        line_lower = line.lower().strip()
+        
+        # Skip lines that contain teaching agent prompts or system messages
+        if any(keyword in line_lower for keyword in [
+            'teaching agent', 'system prompt', 'agent prompt', 'instruction:', 
+            'you are a', 'act as', 'your role', 'generate', 'create a course',
+            'llm', 'ai assistant', 'chatgpt', 'copilot'
+        ]):
+            skip_section = True
+            continue
+            
+        # Skip empty lines after filtering
+        if skip_section and line.strip() == '':
+            continue
+        elif line.strip() != '':
+            skip_section = False
+            
+        # Keep the line if it's not filtered
+        if not skip_section:
+            cleaned_lines.append(line)
+    
+    combined_content = '\n'.join(cleaned_lines)
+    
+    # Read planner agent instruction for title and as LLM input
+    planner_path = pathlib.Path("Inputs and Outputs/planner_agent_instruction.txt")
+    planner_text = ""
+    if planner_path.exists():
+        try:
+            planner_text = planner_path.read_text(encoding='utf-8')
+        except Exception:
+            planner_text = planner_path.read_text(errors='ignore')
+
+    # Determine course title from planner
+    course_title = extract_title_from_planner(planner_text) or extract_course_name_from_content(planner_text or combined_content)
+    # If still generic, try config subject
+    if not course_title or course_title == 'course_material':
+        subject = get_subject_from_config()
+        if subject:
+            course_title = subject.replace('_', ' ').title()
+        else:
+            course_title = "Course"
+    
+    # Create output directory named "course material" inside "Inputs and Outputs"
+    output_dir = os.path.join("Inputs and Outputs", "course material")
+    
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+    except Exception as e:
+        print(f"Error creating directory: {e}")
+        return
+    
+    # Build structured TXT via LLM first; fallback to simple assembly if needed
+    structured_text = build_structured_text_llm(combined_content, planner_text, course_title)
+    if not structured_text:
+        # Minimal fallback ensuring required headers exist
+        lines = [f"# Course Name: {course_title}", "", "## Course Overview", "", "## Weekly Summary", "- Week 1", "", "# Week 1: Introduction", "Content TBD"]
+        structured_text = "\n".join(lines)
+    txt_path = write_structured_txt(structured_text, course_name=course_title, output_dir=output_dir)
+    
+    # Create combined DOCX and PDF from structured text
+    docx_path = create_combined_docx(structured_text, course_title, output_dir)
+    pdf_path = create_combined_pdf(structured_text, course_title, output_dir)
+    
+    # Only show success message if both files created
+    if docx_path and pdf_path:
+        print("Course materials created successfully!")
+        base = sanitize_filename(course_title)
+        print(f"Files created: {base}.txt, {base}.docx and {base}.pdf")
+    else:
+        print("Error creating course materials")
+
+if __name__ == "__main__":
+    main()

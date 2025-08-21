@@ -1,0 +1,9 @@
+google-adk
+google-genai
+python-dotenv 
+reportlab
+python-docx
+python-pptx
+fastapi
+uvicorn[standard]
+python-multipart
